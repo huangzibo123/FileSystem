@@ -195,21 +195,22 @@ void writeInode(FileSystem* fs, ui16 inode_num, INode* inode) {
     
 }
 
-//从文件系统中读取数据块号为 data_block_num 的数据块到缓冲区 buf 中
+//该函数用于从文件系统中读取数据块号为data_block_num的数据块到缓冲区buf中数据块在磁盘上的偏移量
 void dataReadBlock(FileSystem* fs, int data_block_num, void* buf){
+    //计算数据块在磁盘上的偏移量
     int offset = 1 + fs->super_block.inode_bitmap_block + fs->super_block.block_bitmap_block + fs->super_block.inode_table_block;
     diskReadBlock(&fs->disk, data_block_num + offset, buf);
 }
 
-//将缓冲区 buf 中的数据写入文件系统中数据块号为 data_block_num 的数据块
+// 该函数用于将缓冲区buf中的数据写入文件系统中数据块号为data_block_num的数据块
 void dataWriteBlock(FileSystem* fs, int data_block_num, void* buf){
+    //计算数据块在磁盘上的偏移量
     int offset = 1 + fs->super_block.inode_bitmap_block + fs->super_block.block_bitmap_block + fs->super_block.inode_table_block;
     diskWriteBlock(&fs->disk, data_block_num + offset, buf);
 }
 
-//创建一个新的 inode 并返回其编号
+//创建一个新的 inode 并返回其编号，获取可用的第一个inode编号，然后初始化一个新的inode结构体，包括inode编号、创建时间、修改时间、访问时间、链接计数、直接数据块、一级索引块、二级索引块、文件大小、文件类型等信息，最后返回新创建的inode编号
 ui16 createNewInode(FileSystem* fs, ui16 type) {
-    // pirintInodeMap(fs);
     INode res;
     ui16 inode_num = getFirstInode(fs);
     res.inode_number = inode_num;
@@ -240,81 +241,98 @@ ui16 createNewInode(FileSystem* fs, ui16 type) {
     return res.inode_number;
 }
 
-//释放一级索引块及其指向的数据块
+//该函数的作用是释放一级索引块及其指向的数据块
 int freeFirstIndex(FileSystem* fs, ui16 data_block, int allocated_num) {
+    //分配一个缓冲区用于读取一级索引块
     ui16* index = (ui16*)malloc(fs->super_block.block_size);
+    //从文件系统中读取一级索引块的内容到缓冲区
     dataReadBlock(fs, data_block, index);
+    //遍历一级索引块中的数据块，逐个释放数据块
     for (int i = 0; i < fs->super_block.block_size / sizeof(ui16) && allocated_num > 0; ++i) {
         allocated_num -= freeBlock(fs, index[i]);//-1
     }
     free(index);
     freeBlock(fs, data_block);
-    return allocated_num;
+    return allocated_num;//最后返回未释放的数据块数量
 }
 
 //释放二级索引块及其指向的数据块及其指向的一级索引块和数据块
 int freeSecondIndex(FileSystem* fs, ui16 data_block, int allocated_num) {
+    //分配一个缓冲区用于读取二级索引块
     ui16* index = (ui16*)malloc(fs->super_block.block_size);
+    //从文件系统中读取二级索引块的内容到缓冲区
     dataReadBlock(fs, data_block, index);
+    //遍历二级索引块中的一级索引块，逐个调用 freeFirstIndex 释放数据块
     for (int i = 0; i < fs->super_block.block_size / sizeof(int) && allocated_num; ++i) {
         allocated_num = freeFirstIndex(fs, index[i], allocated_num);
     }
     free(index);
     freeBlock(fs, data_block);
-    return allocated_num;
+    return allocated_num;//最后返回未释放的数据块数量
 }
 
 //释放一个 inode 占用的所有数据块
 int fsFree(FileSystem* fs, INode* inode) {
+    //计算文件占用的数据块数量
     int allocated_num = (inode->size + fs->super_block.block_size - 1) / fs->super_block.block_size;
+    //遍历直接数据块，逐个调用 freeBlock 释放数据块
     for (int i = 0; i < 10 && allocated_num > 0; ++i) {
         allocated_num -= freeBlock(fs, inode->direct_block[i]);
     }    
-
+    //如果还有未释放的数据块，调用 freeFirstIndex 释放一级索引块及其指向的数据块
     if (allocated_num > 0) {
         allocated_num = freeFirstIndex(fs, inode->first_inedxed_block, allocated_num);
     }
+    // 如果还有未释放的数据块，调用 freeSecondIndex 释放二级索引块及其指向的数据块及其指向的一级索引块和数据块
     if (allocated_num > 0) {
         allocated_num = freeSecondIndex(fs, inode->second_indexed_block, allocated_num);
     }
+    //如果还有未释放的数据块，可能表示分配计数错误或者其他问题，可以根据需要进行错误处理
     if (allocated_num > 0) {
         // fprintf(stderr, "error: allocated_num > 0\n");
     }
-    return !allocated_num;
+    return !allocated_num;//返回值表示释放是否成功
 }
 
 //为一个 inode 分配数据块以满足指定的大小
 void fsAllocate(FileSystem*fs, INode* inode, int size) {
-    int old_block = inode->size / fs->super_block.block_size;   // 申请前的块数
+    //计算申请前的数据块数量
+    int old_block = inode->size / fs->super_block.block_size;   
+    //计算申请后的文件大小
     int new_size = size + inode->size;
-    int end_block = new_size / fs->super_block.block_size;      // 申请完之后的块数
+    //计算申请后的数据块数量
+    int end_block = new_size / fs->super_block.block_size;
+    //更新文件大小
     inode->size = new_size;
+    // 设置起始块
     int cur_block = old_block + 1;
+    //计算需要申请的数据块数量
     int needed_block = end_block - old_block;
     if (needed_block == 0) {
         return;
     }
 
-    // 申请块
+    // 循环申请新的数据块，并标记为占用
     ui16* blocks = (ui16*)malloc(needed_block * sizeof(ui16));
     for (int i = 0; i < needed_block; ++i) {
         blocks[i] = getFirstBlock(fs);
         occupyBlock(fs, blocks[i]);
     }
 
+    //设置基准块，用于计算索引块的位置
     int base = 0;
 
-    // 是否在10个块内
+    // 如果在直接数据块范围内，分配直接数据块
     if (old_block < 10) {
         for (int i = cur_block; i < 10 && cur_block <= end_block; ++i) {
             inode->direct_block[i] = blocks[i - cur_block];
             cur_block++;
         }
     }
-
+    // 更新基准块
     base += 10;
 
-    // 是否在一级索引块内
+    // 计算一级索引块中的索引个数, 如果在一级索引块范围内，分配一级索引块
     int index_pre_block = fs->super_block.block_size / sizeof(ui16);
     if (cur_block >= base && cur_block <= end_block) {
         ui16* first_index = (ui16*)malloc(fs->super_block.block_size);
@@ -331,14 +349,15 @@ void fsAllocate(FileSystem*fs, INode* inode, int size) {
             first_index[i] = blocks[cur_block - old_block];
             cur_block++;
         }
-
+        // 将一级索引块写回磁盘并释放缓冲区
         dataWriteBlock(fs, inode->first_inedxed_block, first_index);
         free(first_index);
     }
 
+    //更新基准块
     base += index_pre_block;
 
-    // 是否在二级索引块内
+    // 如果在二级索引块范围内，分配二级索引块
     if (cur_block >= base && cur_block <= end_block) {
         ui16* second_index = (ui16*)malloc(fs->super_block.block_size);
         if (old_block >= base) {
@@ -350,6 +369,7 @@ void fsAllocate(FileSystem*fs, INode* inode, int size) {
             memset(second_index, 0xff, fs->super_block.block_size);
         }
 
+        //分配二级索引块中的一级索引块和数据块
         for (int i = cur_block - base; i < index_pre_block && cur_block <= end_block; ++i) {
             ui16* first_index = (ui16*)malloc(fs->super_block.block_size);
             if (old_block >= base + i * index_pre_block) {
@@ -369,7 +389,7 @@ void fsAllocate(FileSystem*fs, INode* inode, int size) {
             dataWriteBlock(fs, second_index[i], first_index);
             free(first_index);
         }
-
+        //将二级索引块写回磁盘并释放缓冲区
         dataWriteBlock(fs, inode->second_indexed_block, second_index);
         free(second_index);
     }
@@ -387,27 +407,34 @@ void fsReAllocate(FileSystem* fs, INode* inode, int size) {
 
 //从文件系统中读取指定 inode 的数据
 int fsRead(FileSystem*fs, INode* inode, int offset, void* res, int size) {
+    //如果读取的范围超出文件大小，报错并返回
     if (offset + size > inode->size) {
         // fprintf(stderr, "error: index over flow\n");
         return;    
     }
     // printf("fsRead ing: %d %d %d\n",inode->inode_number, offset, size);
+    
+    //初始化结果指针，用于记录已经读取的数据量
     int res_ptr = 0;
 
+    //获取块大小
     const int block_size = fs->super_block.block_size;
     void* buffer = malloc(block_size);
 
+    //初始化读取范围的起始、结束和当前位置
     int begin = offset;
     int end = offset + size - 1;
     int cur = begin;
 
+    //计算开始、结束和当前位置所在的数据块
     int begin_block = begin / block_size;
     int end_block = end / block_size;
     int cur_block = begin_block;
 
+    //初始化基准块，用于计算索引块的位置
     int block_base = 0;
     
-    
+    // 如果在直接数据块范围内，从直接数据块中读取数据
     if (cur_block < 10 && cur_block <= end_block) {
         // 在直接块内
         for (int i = cur_block; i < 10 && cur_block <= end_block; ++i) {
@@ -422,10 +449,13 @@ int fsRead(FileSystem*fs, INode* inode, int offset, void* res, int size) {
         }
     }
     
+    //更新基准块
     block_base += 10;
 
+    //计算一级索引块中的索引个数
     const int index_pre_block = block_size / sizeof(ui16);
 
+    //如果在一级索引块范围内，从一级索引块中读取数据
     if (cur_block >= block_base && cur_block <= end_block) {
         // 在一级索引块内
         ui16* first_index = (ui16*)malloc(block_size);
@@ -443,15 +473,19 @@ int fsRead(FileSystem*fs, INode* inode, int offset, void* res, int size) {
         free(first_index);
     }
 
+    // 更新基准块
     block_base += index_pre_block;
     
+    //如果在二级索引块范围内，从二级索引块中读取数据
     if (cur_block >= block_base && cur_block <= end_block) {
         ui16* second_index = (ui16*)malloc(fs->super_block.block_size);
         dataReadBlock(fs, inode->second_indexed_block, second_index);
 
+        //遍历二级索引块中的一级索引块
         for (int i = cur_block - block_base; i < index_pre_block && cur_block <= end_block; ++i) {
             ui16* first_index = (ui16*)malloc(fs->super_block.block_size);
             dataReadBlock(fs, second_index[i], first_index);
+            //从一级索引块指向的直接数据块中读取数据
             for (int j = cur_block - block_base - i * index_pre_block; j < index_pre_block && cur_block <= end_block; ++j) {
                 dataReadBlock(fs, first_index[j], buffer);
                 int l = cur % block_size;
@@ -463,42 +497,52 @@ int fsRead(FileSystem*fs, INode* inode, int offset, void* res, int size) {
                 cur_block++;
                 cur += r - l + 1;
             }
+            //将更新后的一级索引块写回磁盘并释放缓冲区
             dataWriteBlock(fs, second_index[i], first_index);
             free(first_index);
         }
-
+        //将更新后的二级索引块写回磁盘并释放缓冲区
         dataWriteBlock(fs, inode->second_indexed_block, second_index);
         free(second_index);
     }
     // printf("OKKKK\n");
-    return cur - begin;
+    return cur - begin;//返回实际读取的数据量，即当前位置减去开始位置
 }
+
 
 //向文件系统中写入指定 inode 的数据
 void fsWrite(FileSystem*fs, INode* inode, int offset, void* context, int size) {
     // 参考fsRead
     // printf("fsWrite ing: %d %d %d\n", inode->inode_number, offset, size);
+
+    //检查写操作是否需要分配更多的数据块，如果是，则调用 fsAllocate 函数进行分配
     if (offset + size > inode->size) {
         fsAllocate(fs, inode, offset + size - inode->size);
     }
     // printf("fsWrite ing cur size: %d %d \n", inode->inode_number, inode->size);
     // printf("fsWrite ing: %d %d %d\n", inode->inode_number, offset, size);
-    int context_ptr = 0;
 
+    //初始化一个指针，用于跟踪当前写入数据的位置
+    int context_ptr = 0;
+    // 获取文件系统块的大小
     const int block_size = fs->super_block.block_size;
     
     void* buffer = malloc(block_size);
 
+    //初始化开始位置、结束位置和当前位置
     int begin = offset;
     int end = offset + size - 1;
     int cur = begin;
 
+    // 计算开始块、结束块和当前块
     int begin_block = begin / block_size;
     int end_block = end / block_size;
     int cur_block = begin_block;
 
+    //初始化块的基础值，用于区分直接块、一级索引块和二级索引块
     int block_base = 0;
 
+    // 如果在直接数据块范围内，向直接数据块写数据
     if (cur_block < 10 && cur_block <= end_block) {
         // 在直接块内
         for (int i = cur_block; i < 10 && cur_block <= end_block; ++i) {
@@ -506,18 +550,23 @@ void fsWrite(FileSystem*fs, INode* inode, int offset, void* context, int size) {
             int l = cur % block_size;
             int r = (cur_block == end_block) ? end % block_size : block_size - 1;
             // printf("Writing direct block %d %dto%d\n", inode->direct_block[i],l, r);
+            //将上下文中的数据复制到缓冲区
             memcpy(buffer + l, context + context_ptr, r - l + 1);
+            //将缓冲区的数据写入当前直接块
             dataWriteBlock(fs, inode->direct_block[i], buffer);
+            //更新指针和计数器
             context_ptr += r - l + 1;
             cur_block++;
             cur += r - l + 1;
         }
     }
     
+    // 更新基准块
     block_base += 10;
 
     const int index_pre_block = block_size / sizeof(ui16);
 
+    //如果在一级索引块范围内，向一级索引块中写数据
     if (cur_block >= block_base && cur_block <= end_block) {
         // 在一级索引块内
         ui16* first_index = (ui16*)malloc(block_size);
@@ -527,8 +576,11 @@ void fsWrite(FileSystem*fs, INode* inode, int offset, void* context, int size) {
             int l = cur % block_size;
             int r = (cur_block == end_block) ? end % block_size : block_size - 1;
             // printf("Writing block %d %dto%d\n", inode->direct_block[i],l, r);
+            //将上下文中的数据复制到缓冲区
             memcpy(buffer + l, context + context_ptr, r - l + 1);
+            //将缓冲区的数据写入当前直接块
             dataWriteBlock(fs, first_index[i], buffer);
+            //更新指针和计数器
             context_ptr += r - l + 1;
             cur_block++;
             cur += r - l + 1;
@@ -536,12 +588,14 @@ void fsWrite(FileSystem*fs, INode* inode, int offset, void* context, int size) {
         free(first_index);
     }
 
+    // 更新基准块
     block_base += index_pre_block;
     
+    //如果在二级索引块范围内，向二级索引块中写数据
     if (cur_block >= block_base && cur_block <= end_block) {
         ui16* second_index = (ui16*)malloc(fs->super_block.block_size);
         dataReadBlock(fs, inode->second_indexed_block, second_index);
-
+        //遍历二级索引块中的一级索引块
         for (int i = cur_block - block_base; i < index_pre_block && cur_block <= end_block; ++i) {
             ui16* first_index = (ui16*)malloc(fs->super_block.block_size);
             dataReadBlock(fs, second_index[i], first_index);
@@ -565,9 +619,8 @@ void fsWrite(FileSystem*fs, INode* inode, int offset, void* context, int size) {
     }
     // printf("FUCKKKKKK\n");
 
-    free(buffer);
+    free(buffer);//释放用于缓冲区的内存
 }
-
 // 从 src 复制 size 字节的数据到 *dst，并更新 *dst 指向下一个位置，处理数据的序列化
 void receiveAndShift(void** dst, void* src, int size) {
     memcpy(*dst, src, size);
